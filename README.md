@@ -1,36 +1,27 @@
-# Indian Mutual Fund Look-through & Overlap Analyzer
+# the book
 
-Simple Streamlit web app for retail investors to see true look-through exposure and overlap across their mutual funds.
+Search an Indian mutual fund and see whether it has behaved like the index it is measured against.
 
-## Features (v1)
-- Search Indian mutual fund schemes (via free MFapi.in)
-- Enter allocations
-- Look-through aggregated portfolio weights
-- Pairwise weighted overlap heatmap
-- Top stocks appearing in multiple funds
-- Demo mode with sample data so visualizations work immediately
+No upload and no account. The scheme you pick is the book. One year is the default window. Three and five years are there.
 
-## Deploy on Streamlit Community Cloud (Free)
+## What is on
 
-1. Create a free GitHub account if you don't have one.
-2. Create a new public repository (e.g. `mf-overlap`).
-3. Upload these files to the repository:
-   - `app.py`
-   - `requirements.txt`
-4. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-5. Click "New app", select your repository, branch `main`, and main file `app.py`.
-6. Deploy. You will get a free public URL (e.g. `https://yourname-mf-overlap.streamlit.app`).
-7. Later you can point your own domain to it via Streamlit settings or a reverse proxy.
+- The sentence for the fund you picked
+- Direct or regular plan, and the other plan when one exists
+- Beta, R-squared, tracking error, active return, up and down capture
+- The worst fall, and how long it took to get back
+- A few funds in the same category, beside the numbers, not as a rank
+- What a rupee amount would have become over the window. That is the past, not a forecast
 
-## Local run (optional)
+The public NAV feed does not publish the expense ratio or the holdings file, so rupees a year and crowding stay empty rather than invented. The yardstick is an index fund, not the official total-return index. The page says so.
+
+## Run
+
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+npm install
+npm run dev
 ```
 
-## Notes
-- Demo mode works fully offline for visualizations.
-- Live holdings currently show a warning because free community holdings APIs are unstable. The calculation engine is ready; we can add Excel upload or a stable API next.
-- Built for Indian market, 1+ year horizon, zero coding required after deployment.
+The app listens on port 8080.
 
-Not investment advice.
+These figures describe the window you pick. They are not a forecast and not advice.
