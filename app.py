@@ -621,6 +621,9 @@ def mix_held(lots: list[tuple[int, str, float, str]]) -> Optional[dict]:
     ending = 0.0
     end_iso = ""
     for code, _name, amount, bought in lots:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", bought or ""):
+            flows = []
+            break
         payload = load_scheme(code)
         rows = payload.get("data") or []
         buy = _nav_on_or_before(rows, bought)
@@ -647,6 +650,58 @@ def mix_held(lots: list[tuple[int, str, float, str]]) -> Optional[dict]:
         "var": historical_tail(returns),
         "personal": personal,
     }
+
+
+def rows_from_upload(name: str, data: bytes) -> tuple[list[tuple[str, float, str]], str]:
+    """Return (fund name, invested amount, date or empty). Ignores a person's name and PAN."""
+    import io
+
+    import pandas as pd
+
+    if name.lower().endswith(".csv"):
+        frame = pd.read_csv(io.BytesIO(data))
+    else:
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
+        frame = None
+        for sheet in sheets.values():
+            for index, row in sheet.iterrows():
+                cells = [str(cell).strip().lower() for cell in row.tolist()]
+                if "fund name" in cells and any("invest" in cell for cell in cells):
+                    frame = sheet.iloc[index + 1 :].copy()
+                    frame.columns = [str(cell).strip() for cell in row.tolist()]
+                    break
+            if frame is not None:
+                break
+        if frame is None:
+            return [], "Need a Fund Name column and an Invested Value column."
+    columns = {str(column).strip().lower(): column for column in frame.columns}
+    name_col = next((columns[key] for key in columns if key in {"fund name", "scheme", "name", "fund"}), None)
+    amount_col = next((columns[key] for key in columns if "invest" in key or key == "amount"), None)
+    code_col = columns.get("code")
+    date_col = columns.get("date")
+    if amount_col is None or (name_col is None and code_col is None):
+        return [], "Need fund name and invested value, or code and amount."
+    rows = []
+    for _, row in frame.iterrows():
+        raw_amount = str(row[amount_col]).replace(",", "").replace("₹", "").strip()
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            continue
+        if amount <= 0:
+            continue
+        label = str(row[code_col]).strip() if code_col is not None else str(row[name_col]).strip()
+        if label.lower() in {"nan", "none", ""} or "pan" in label.lower():
+            continue
+        bought = ""
+        if date_col is not None:
+            bought = str(row[date_col]).strip()[:10]
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", bought):
+                bought = ""
+        rows.append((label, amount, bought))
+    if not rows:
+        return [], "No fund rows in that file."
+    return rows[:30], ""
 
 
 def run_ui() -> None:
@@ -676,6 +731,93 @@ def run_ui() -> None:
     st.sidebar.markdown("## the book")
     room = st.sidebar.radio("Room", ROOMS, key="room", label_visibility="collapsed")
 
+    find, bring = st.columns(2)
+    with find:
+        st.text_input(
+            "Mutual fund",
+            key="query",
+            placeholder="Search a scheme, for example Parag Parikh",
+        )
+        if st.button("Search"):
+            query = st.session_state.query.strip()
+            if len(query) < 2:
+                st.session_state.error = "Type at least two letters."
+                st.session_state.hits = []
+            else:
+                try:
+                    st.session_state.hits = search_schemes(query)
+                    st.session_state.error = "" if st.session_state.hits else "No growth schemes matched."
+                except Exception as exc:
+                    st.session_state.hits = []
+                    st.session_state.error = str(exc)
+        for hit in list(st.session_state.hits):
+            if st.button(hit["name"], key=f"hit-{hit['code']}"):
+                with st.spinner("Reading the fund’s history…"):
+                    try:
+                        st.session_state.analysis = analyse(hit["code"], st.session_state.horizon)
+                        st.session_state.hits = []
+                        st.session_state.error = ""
+                        st.session_state.go_book = True
+                        st.session_state.clear_query = True
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state.error = str(exc)
+    with bring:
+        st.caption("Upload the funds you hold. A name or PAN in the file is ignored.")
+        upload = st.file_uploader("Portfolio file", type=["csv", "xlsx"], label_visibility="collapsed")
+        if st.button("Load a synthetic book"):
+            st.session_state.lots = list(DUMMY_LOTS)
+            st.session_state.mix = None
+        if upload is not None:
+            token = f"{upload.name}:{upload.size}"
+            if st.session_state.get("upload_token") != token:
+                st.session_state.upload_token = token
+                parsed, err = rows_from_upload(upload.name, upload.getvalue())
+                if err:
+                    st.session_state.error = err
+                else:
+                    lots = []
+                    missed = []
+                    for label, amount, bought in parsed:
+                        if re.fullmatch(r"\d+", label):
+                            lots.append((int(label), f"Scheme {label}", amount, bought))
+                            continue
+                        try:
+                            hits = search_schemes(label[:60])
+                        except Exception:
+                            hits = []
+                        if hits:
+                            lots.append((hits[0]["code"], hits[0]["name"], amount, bought))
+                        else:
+                            missed.append(label)
+                    st.session_state.lots = lots
+                    st.session_state.mix = None
+                    st.session_state.error = "" if not missed else "Not matched: " + "; ".join(missed[:5])
+        lots = st.session_state.get("lots") or []
+        if lots:
+            st.caption(f"{len(lots)} funds on this page. This is your mix, not the scheme you opened.")
+            if st.button("Read this mix"):
+                ready = [lot for lot in lots if lot[0]]
+                with st.spinner("Reading the funds…"):
+                    try:
+                        st.session_state.mix = mix_held(ready) if ready else None
+                        st.session_state.mix_error = "" if ready else "Nothing matched."
+                    except Exception as exc:
+                        st.session_state.mix = None
+                        st.session_state.mix_error = str(exc)
+
+    if st.session_state.error:
+        st.warning(st.session_state.error)
+
+    mix = st.session_state.get("mix")
+    if mix and room == "Overview":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Put in", inr(mix["start_value"]))
+        c2.metric("Held to the end", inr(mix["end_value"]))
+        c3.metric("Time-weighted", pct(mix["annualised"]))
+        c4.metric("Money-weighted", pct(mix["personal"]))
+        st.caption("The mix you uploaded. Not one fund’s return.")
+
     analysis = st.session_state.analysis
     if (
         analysis
@@ -692,41 +834,6 @@ def run_ui() -> None:
                 st.session_state.error = str(exc)
         analysis = st.session_state.analysis
 
-    st.text_input(
-        "Mutual fund",
-        key="query",
-        placeholder="Search a scheme, for example Parag Parikh",
-    )
-    if st.button("Search"):
-        query = st.session_state.query.strip()
-        if len(query) < 2:
-            st.session_state.error = "Type at least two letters."
-            st.session_state.hits = []
-        else:
-            try:
-                st.session_state.hits = search_schemes(query)
-                st.session_state.error = "" if st.session_state.hits else "No growth schemes matched."
-            except Exception as exc:
-                st.session_state.hits = []
-                st.session_state.error = str(exc)
-
-    for hit in list(st.session_state.hits):
-        if st.button(hit["name"], key=f"hit-{hit['code']}"):
-            with st.spinner("Reading the fund’s history…"):
-                try:
-                    st.session_state.analysis = analyse(hit["code"], st.session_state.horizon)
-                    st.session_state.hits = []
-                    st.session_state.error = ""
-                    st.session_state.go_book = True
-                    st.session_state.clear_query = True
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state.error = str(exc)
-
-    if st.session_state.error:
-        st.warning(st.session_state.error)
-
-    analysis = st.session_state.analysis
     if analysis:
         st.radio(
             "Window",
@@ -744,8 +851,8 @@ def run_ui() -> None:
                 st.caption(f"This fund only has {analysis['paired']} months in the window you picked.")
 
     if not analysis and room != "Portfolio":
-        st.title("Pick a fund. You do not need to upload anything.")
-        st.write("The book is the scheme you select. A portfolio is optional, and research does not ask for a name.")
+        st.title("Open a fund, or upload the ones you hold.")
+        st.write("Search is the scheme. The file on the right is your mix. You can do either, or both.")
     elif room == "Overview" and analysis:
         st.caption(analysis["fund"]["category"])
         st.title(verdict(analysis))
