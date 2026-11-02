@@ -16,16 +16,49 @@ BENCH = {
 }
 
 ROOMS = [
-    "Book",
-    "What you own",
-    "Cost",
-    "The index",
-    "Why it moved",
+    "Overview",
+    "Performance",
+    "Benchmark",
+    "Drivers",
     "Risk",
+    "Holdings",
     "Crowding",
-    "Decide",
-    "A fund",
-    "How to read this",
+    "Peers",
+    "What-if",
+    "Portfolio",
+]
+
+# Synthetic demo. Not a disclosure. Names are real; weights are made up.
+HOLDINGS = {
+    122639: [
+        ("Reliance Industries", "INE002A01018", 0.08),
+        ("HDFC Bank", "INE040A01034", 0.07),
+        ("Infosys", "INE009A01021", 0.06),
+        ("ICICI Bank", "INE090A01021", 0.05),
+        ("Tata Consultancy Services", "INE467B01029", 0.04),
+        ("Alphabet", "US02079K3059", 0.04),
+        ("ITC", "INE154A01025", 0.03),
+        ("Larsen & Toubro", "INE018A01030", 0.03),
+    ],
+    120716: [
+        ("HDFC Bank", "INE040A01034", 0.12),
+        ("Reliance Industries", "INE002A01018", 0.09),
+        ("ICICI Bank", "INE090A01021", 0.08),
+        ("Infosys", "INE009A01021", 0.06),
+        ("Tata Consultancy Services", "INE467B01029", 0.05),
+        ("State Bank of India", "INE062A01020", 0.04),
+        ("Bharti Airtel", "INE397D01024", 0.04),
+        ("Hindustan Unilever", "INE030A01027", 0.03),
+    ],
+}
+HOLDINGS_AS_OF = "2026-09-30"
+HOLDINGS_LABEL = "Synthetic demo. Not a fund disclosure. Names are real securities; weights are made up."
+DUMMY_LOTS = [
+    (122639, "Parag Parikh Flexi Cap Fund - Direct Plan - Growth", 100000, "2024-04-01"),
+    (120716, "UTI Nifty 50 Index Fund - Direct Plan - Growth", 100000, "2024-04-01"),
+    (143341, "UTI Nifty Next 50 Index Fund - Direct Plan - Growth", 50000, "2024-06-03"),
+    (118955, "HDFC Flexi Cap Fund - Direct Plan - Growth Option", 75000, "2024-06-03"),
+    (119091, "HDFC Liquid Fund - Direct Plan - Growth Option", 50000, "2025-01-02"),
 ]
 
 _SCHEME_CACHE: dict[int, dict] = {}
@@ -335,6 +368,7 @@ def analyse(code: int, months: int) -> dict:
         "sibling": sibling,
         "sample_growth": 100000 * compounded(returns),
         "asked_months": months,
+        "returns": returns,
     }
 
 
@@ -396,7 +430,7 @@ def peers_for(analysis: dict) -> list[dict]:
             )
         except Exception:
             continue
-        if len(rows) == 3:
+        if len(rows) == 5:
             break
     return rows
 
@@ -441,6 +475,178 @@ def verdict(analysis: dict) -> str:
     elif fund["plan"] == "direct":
         sentence += " It is the direct plan."
     return sentence
+
+
+def holdings_book(code: int) -> Optional[dict]:
+    rows = HOLDINGS.get(code)
+    if not rows:
+        return None
+    from datetime import date
+
+    mapped = sum(weight for _, _, weight in rows)
+    as_of = date.fromisoformat(HOLDINGS_AS_OF)
+    days = (date.today() - as_of).days
+    return {
+        "rows": rows,
+        "mapped": mapped,
+        "unknown": max(0.0, 1 - mapped),
+        "days": days,
+        "stale": days > 31,
+        "as_of": HOLDINGS_AS_OF,
+    }
+
+
+def herfindahl(weights: list[float]) -> Optional[float]:
+    if not weights or any(weight < 0 for weight in weights):
+        return None
+    if abs(sum(weights) - 1) > 0.005:
+        return None
+    return sum(weight * weight for weight in weights)
+
+
+def known_overlap(left: int, right: int) -> Optional[float]:
+    a = {isin: weight for _, isin, weight in HOLDINGS.get(left, [])}
+    b = {isin: weight for _, isin, weight in HOLDINGS.get(right, [])}
+    if not a or not b:
+        return None
+    return sum(min(weight, b.get(isin, 0)) for isin, weight in a.items())
+
+
+def holder_counts(code: int) -> list[tuple[str, int]]:
+    rows = HOLDINGS.get(code) or []
+    out = []
+    for name, isin, _weight in rows:
+        count = sum(1 for book in HOLDINGS.values() if any(row[1] == isin for row in book))
+        out.append((name, count))
+    return out
+
+
+def historical_tail(returns: list[float]) -> Optional[float]:
+    if len(returns) < 12:
+        return None
+    import math
+
+    ordered = sorted(returns)
+    index = max(0, math.ceil(0.05 * len(ordered)) - 1)
+    return ordered[index]
+
+
+def bootstrap_median(returns: list[float], seed: int = 17) -> Optional[float]:
+    if len(returns) < 12:
+        return None
+    import random
+
+    rng = random.Random(seed)
+    endings = []
+    for _ in range(400):
+        value = 1.0
+        for _month in range(12):
+            value *= 1 + returns[rng.randrange(len(returns))]
+        endings.append(value - 1)
+    endings.sort()
+    return endings[len(endings) // 2]
+
+
+def _nav_on_or_before(rows: list, iso: str) -> Optional[float]:
+    best = None
+    best_key = ""
+    for row in rows or []:
+        parts = str(row.get("date", "")).split("-")
+        if len(parts) != 3:
+            continue
+        key = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        if key > iso:
+            continue
+        try:
+            nav = float(row["nav"])
+        except (TypeError, ValueError):
+            continue
+        if nav > 0 and key > best_key:
+            best = nav
+            best_key = key
+    return best
+
+
+def xirr(flows: list[tuple[str, float]]) -> Optional[float]:
+    if len(flows) < 2:
+        return None
+    from datetime import date
+
+    dated = sorted((date.fromisoformat(iso), amount) for iso, amount in flows)
+    t0 = dated[0][0]
+    years = [(item[0] - t0).days / 365 for item in dated]
+
+    def npv(rate: float) -> float:
+        return sum(amount / (1 + rate) ** years[i] for i, (_day, amount) in enumerate(dated))
+
+    def slope(rate: float) -> float:
+        return sum(-years[i] * amount / (1 + rate) ** (years[i] + 1) for i, (_day, amount) in enumerate(dated))
+
+    rate = 0.1
+    for _ in range(50):
+        d = slope(rate)
+        if d == 0:
+            return None
+        nxt = rate - npv(rate) / d
+        if nxt <= -0.99:
+            return None
+        if abs(nxt - rate) < 1e-8:
+            return nxt
+        rate = nxt
+    return rate if abs(npv(rate)) < 1e-4 else None
+
+
+def mix_held(lots: list[tuple[int, str, float, str]]) -> Optional[dict]:
+    series = []
+    for code, _name, _amount, _date in lots:
+        payload = load_scheme(code)
+        monthly = monthly_returns(month_end_navs(payload.get("data") or []))
+        series.append(monthly[-36:])
+    maps = [dict(rows) for rows in series]
+    months = [ym for ym, _ret in series[0] if all(ym in item for item in maps)]
+    if len(months) < 6:
+        return None
+    values = [amount for _code, _name, amount, _date in lots]
+    returns = []
+    for ym in months:
+        start = sum(values)
+        values = [value * (1 + maps[i][ym]) for i, value in enumerate(values)]
+        end = sum(values)
+        if start > 0:
+            returns.append(end / start - 1)
+    start_value = sum(amount for _c, _n, amount, _d in lots)
+    end_value = sum(values)
+    personal = None
+    flows = []
+    ending = 0.0
+    end_iso = ""
+    for code, _name, amount, bought in lots:
+        payload = load_scheme(code)
+        rows = payload.get("data") or []
+        buy = _nav_on_or_before(rows, bought)
+        latest = rows[-1] if rows else None
+        if buy is None or not latest:
+            flows = []
+            break
+        parts = str(latest["date"]).split("-")
+        iso = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        ending += (amount / buy) * float(latest["nav"])
+        end_iso = iso if iso > end_iso else end_iso
+        flows.append((bought, -amount))
+    if flows and ending > 0:
+        flows.append((end_iso, ending))
+        personal = xirr(flows)
+    return {
+        "start": months[0],
+        "end": months[-1],
+        "months": len(months),
+        "start_value": start_value,
+        "end_value": end_value,
+        "annualised": annualised(end_value / start_value, len(months)),
+        "vol": _stdev(returns) * (12 ** 0.5),
+        "var": historical_tail(returns),
+        "personal": personal,
+    }
 
 
 def run_ui() -> None:
@@ -537,39 +743,25 @@ def run_ui() -> None:
             else:
                 st.caption(f"This fund only has {analysis['paired']} months in the window you picked.")
 
-    if not analysis:
+    if not analysis and room != "Portfolio":
         st.title("Pick a fund. You do not need to upload anything.")
-        st.write(
-            "The book is the scheme you select. What you own, and the rupee cost of money you have not put in, stay empty until you have a holding."
-        )
-    elif room == "Book":
+        st.write("The book is the scheme you select. A portfolio is optional, and research does not ask for a name.")
+    elif room == "Overview" and analysis:
         st.caption(analysis["fund"]["category"])
         st.title(verdict(analysis))
-        st.caption(f"{analysis['start']} to {analysis['end']}. {analysis['paired']} months.")
-    elif room == "What you own":
-        st.title("What you own")
-        st.write(
-            "You have not entered a holding. This room is the stocks behind money you already have, and the rupees counted twice across your funds. The scheme you picked is not that."
-        )
-    elif room == "Cost":
-        plan = analysis["fund"]["plan"]
-        st.title("What it charges")
-        shown = "plan we could not classify" if plan == "unknown" else f"{plan} plan"
-        st.write(
-            f"This is the {shown}. The public NAV feed does not publish the expense ratio, so rupees a year are not invented."
-        )
-        sibling = analysis["sibling"]
-        if sibling and st.button(f"Open the {'regular' if plan == 'direct' else 'direct'} plan"):
-            with st.spinner("Reading the fund’s history…"):
-                try:
-                    st.session_state.analysis = analyse(sibling["code"], st.session_state.horizon)
-                    st.session_state.go_book = True
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-        elif not sibling:
-            st.caption("No matching other plan showed up in the search.")
-    elif room == "The index":
+        st.caption(f"{analysis['start']} to {analysis['end']}. {analysis['paired']} months. Source mfapi.in.")
+        fund = analysis["fund"]
+        st.write(f"**{fund['name']}**")
+        st.write(f"{fund['house']} · {fund['plan']} plan · ISIN {fund['isin'] or 'not published'}")
+    elif room == "Performance" and analysis:
+        st.title("Performance")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Annualised", pct(analysis["fund_return"]))
+        c2.metric("Volatility", pct(analysis["vol"]))
+        c3.metric("Growth of ₹1 lakh", inr(analysis["sample_growth"]))
+        st.caption("The fund’s history over this window. Not your money, and not a forecast.")
+        _path(st, analysis)
+    elif room == "Benchmark" and analysis:
         st.title("The index it is measured against")
         st.write(analysis["yardstick_note"])
         if analysis["yardstick"]:
@@ -583,32 +775,22 @@ def run_ui() -> None:
                 ("Beta", f"{stats['beta']:.2f}"),
                 ("R-squared", pct(stats["r2"], 0)),
                 ("Tracking error", pct(stats["te"])),
-                ("Active return", pct(stats["active"])),
                 ("Information ratio", f"{stats['ir']:.2f}"),
                 ("Up capture", pct(stats["up_capture"], 0)),
                 ("Down capture", pct(stats["down_capture"], 0)),
-                (
-                    "Beta when the yardstick fell",
-                    f"{stats['down_beta']:.2f}"
-                    if stats["down_beta"] is not None
-                    else f"Needs 4 down months. This window has {stats['down_months']}.",
-                ),
             ]
             for i, (label, value) in enumerate(rows):
                 (left if i % 2 == 0 else right).metric(label, value)
-    elif room == "Why it moved":
-        st.title("Why it moved")
+    elif room == "Drivers" and analysis:
+        st.title("Drivers")
+        st.write("Method: Brinson-Fachler.")
         st.write(
-            "The split into market, size, value and momentum needs three years and the IIMA factor file. That file is not in this release, so the leftover is not shown. A peer table is not that split."
+            "Incomplete. Sector returns are not in the public feed, and the holdings file does not cover the whole fund. No effect is estimated."
         )
-        st.caption(
-            "Beside it, a few other direct growth funds the search returned for the same category. Not the full peer group, and not a rank."
-        )
-        _peer_table(st, analysis)
-    elif room == "Risk":
+    elif room == "Risk" and analysis:
         st.title("When it hurts")
         dd = analysis["drawdown"]
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Volatility", pct(analysis["vol"]))
         c2.metric("Worst fall", pct(None if dd is None else dd["max_dd"]))
         if dd is None:
@@ -618,76 +800,139 @@ def run_ui() -> None:
         else:
             back = "Not yet"
         c3.metric("Months to get back", back)
-        series = analysis["series"]
-        if len(series) > 1:
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=[row["ym"] for row in series],
-                    y=[row["fund"] for row in series],
-                    name="Fund",
-                    line={"color": "#1a1814", "width": 2},
-                )
+        c4.metric("Monthly VaR", pct(historical_tail(analysis["returns"])))
+        st.caption("Historical VaR, 95%, one month. Not a maximum loss. Sharpe uses a 6.5% stand-in, not a live Treasury bill.")
+        _path(st, analysis)
+    elif room == "Holdings" and analysis:
+        book = holdings_book(analysis["fund"]["code"])
+        st.title("Holdings")
+        if not book:
+            st.write("This scheme is not in the synthetic demo file. Weights are not invented for it.")
+        else:
+            st.warning(HOLDINGS_LABEL)
+            stale = " Stale. Still shown, not hidden." if book["stale"] else ""
+            st.caption(
+                f"Demo date {book['as_of']}. {book['days']} days old.{stale} Mapped {pct(book['mapped'], 0)}. Unknown {pct(book['unknown'], 0)}."
             )
-            if analysis["yardstick"] and analysis["index"]:
-                fig.add_trace(
-                    go.Scatter(
-                        x=[row["ym"] for row in series],
-                        y=[row["bench"] for row in series],
-                        name="Yardstick",
-                        line={"color": "#1f6f66", "width": 1.5},
-                    )
-                )
-            fig.update_layout(
-                height=360,
-                margin={"l": 10, "r": 10, "t": 10, "b": 10},
-                paper_bgcolor="#fbf9f4",
-                plot_bgcolor="#fbf9f4",
-                legend={"orientation": "h"},
-                yaxis_title="Growth of one rupee",
+            st.table(
+                [{"Security": name, "Weight": pct(weight, 0)} for name, _isin, weight in book["rows"]]
+                + [{"Security": "Unknown", "Weight": pct(book["unknown"], 0)}]
             )
-            st.plotly_chart(fig, use_container_width=True)
-        _peer_table(st, analysis)
-    elif room == "Crowding":
+    elif room == "Crowding" and analysis:
         st.title("Crowding")
-        st.write(
-            "Crowding is how many schemes hold the same stocks. That needs the monthly holdings file, which is not in this release. A peer’s return is not a substitute, so nothing is shown in its place."
+        book = holdings_book(analysis["fund"]["code"])
+        if not book:
+            st.write("This scheme is not in the synthetic file. A peer’s return is not a substitute.")
+        else:
+            other = 120716 if analysis["fund"]["code"] != 120716 else 122639
+            overlap = known_overlap(analysis["fund"]["code"], other)
+            st.caption(f"Synthetic file only. Sample of {len(HOLDINGS)} schemes.")
+            st.write("HHI = sum of squared weights. Weights must sum to 1.")
+            st.write(
+                "Not calculated. Part of the book is unknown, and that slice is not treated as one holding or spread across the rest."
+            )
+            if overlap is not None:
+                other_name = "UTI Nifty 50 Index Fund" if other == 120716 else "Parag Parikh Flexi Cap Fund"
+                st.write(
+                    f"Known-name overlap with {other_name}: {pct(overlap, 0)}. Unknown weight is left out, so this is not the full overlap."
+                )
+            st.table(
+                [{"Security": name, "Schemes in the file": f"{count} of {len(HOLDINGS)}"} for name, count in holder_counts(analysis["fund"]["code"])]
+            )
+    elif room == "Peers" and analysis:
+        st.title("Peers")
+        st.caption(
+            "Same category words, direct plan, growth option, this scheme left out. Not the official peer group, and not a rank."
         )
-    elif room == "Decide":
-        st.title("If you had put money in")
-        amount = st.number_input("Amount, in rupees", min_value=1000, step=10000, key="amount")
-        grown = (analysis["sample_growth"] / 100000) * float(amount)
-        st.header(inr(grown))
-        st.write(
-            f"{inr(float(amount))} at the start of this window would have been worth this at the end. That is the past. It is not a forecast, and it is not a recommendation."
-        )
-        st.caption("The fee in rupees needs the expense ratio. This feed does not publish it.")
-    elif room == "A fund":
-        st.title("This fund")
-        fund = analysis["fund"]
-        st.write(f"**Name.** {fund['name']}")
-        st.write(f"**House.** {fund['house']}")
-        st.write(f"**Category.** {fund['category']}")
-        st.write(f"**ISIN.** {fund['isin'] or 'Not published'}")
-        st.write(f"**Plan.** {fund['plan']}")
+        _peer_table(st, analysis)
+    elif room == "What-if" and analysis:
+        st.title("What-if")
+        st.write("No portfolio is required. The shock is this fund’s beta times a market move. It is not a forecast.")
+        shock = st.number_input("Equity market move, percent", value=-10.0, step=1.0)
+        beta = None if analysis["index"] is None else analysis["index"]["beta"]
+        if beta is None:
+            st.header("—")
+            st.caption("No beta in this window, so the estimate is off.")
+        else:
+            st.header(pct(beta * shock / 100))
+            st.caption(f"Beta {beta:.2f} times {shock:.1f}%.")
+        st.caption("Model. Each path resamples this fund’s own monthly returns. Seed 17. Not a forecast.")
+        middle = bootstrap_median(analysis["returns"])
+        st.metric("Middle path, 12 months", pct(middle))
+    elif room == "Portfolio":
+        st.title("A portfolio, if you want one.")
+        st.write("Research still works with no portfolio and no name. This mix is not one fund’s CAGR.")
+        if st.button("Load a synthetic book"):
+            st.session_state.lots = list(DUMMY_LOTS)
+        lots = st.session_state.get("lots") or []
+        if lots:
+            st.caption("Synthetic demo. Round amounts and invented dates. Not a person’s account.")
+            st.table(
+                [{"Fund": name, "Amount": inr(amount), "Date": bought} for _code, name, amount, bought in lots]
+            )
+            if st.button("Read this mix"):
+                with st.spinner("Reading the funds…"):
+                    try:
+                        st.session_state.mix = mix_held(lots)
+                        st.session_state.mix_error = ""
+                    except Exception as exc:
+                        st.session_state.mix = None
+                        st.session_state.mix_error = str(exc)
+        mix = st.session_state.get("mix")
+        if st.session_state.get("mix_error"):
+            st.warning(st.session_state.mix_error)
+        if mix:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Put in", inr(mix["start_value"]))
+            c2.metric("Held to the end", inr(mix["end_value"]))
+            c3.metric("Time-weighted", pct(mix["annualised"]))
+            c4.metric("Money-weighted", pct(mix["personal"]))
+            st.caption(
+                f"{mix['start']} to {mix['end']}, {mix['months']} shared months. Time-weighted is the mix. Money-weighted uses the dates. Neither is one fund’s CAGR."
+            )
+            st.caption(f"Mix volatility {pct(mix['vol'])}. Monthly VaR {pct(mix['var'])}. Historical, 95%, one month. Not a maximum loss.")
     else:
-        st.title("How to read this")
-        cards = [
-            ("Beta", "How many points the fund moved when the yardstick moved one. It describes the window. It is not next year’s beta."),
-            ("Tracking error", "How wide the monthly gap versus the yardstick was, as a yearly figure. Over 3 points, it was not hugging the yardstick."),
-            ("R-squared", "How much of the fund’s movement the yardstick explains. Under 0.90, calling it “the index” is a stretch."),
-            ("The yardstick", "An index fund, not the official total-return index. The gap includes that fund’s fee. A large-cap fund is set against a Nifty 50 fund because this feed has no Nifty 100 series."),
-            ("Peers", "A few direct-growth funds the search returned. Not a rank, not a star, and not the thing the sentence is judged against."),
-            ("The amount", "What a sum would have become over the window you picked. The past. Not a forecast, and not your SIP."),
-        ]
-        for title, body in cards:
-            st.subheader(title)
-            st.write(body)
+        st.title("Pick a fund first.")
 
     st.divider()
     st.caption(
-        "These figures describe the window you picked. They are not a forecast. If you have not told us what you hold, this is the fund, not your money."
+        "These figures describe the window you picked. They are the fund’s history, not your money, and not a forecast. The yardstick is an index fund, not the official total-return index."
     )
+
+
+def _path(st, analysis: dict) -> None:
+    import plotly.graph_objects as go
+
+    series = analysis["series"]
+    if len(series) < 2:
+        return
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[row["ym"] for row in series],
+            y=[row["fund"] for row in series],
+            name="Fund",
+            line={"color": "#1a1814", "width": 2},
+        )
+    )
+    if analysis["yardstick"] and analysis["index"]:
+        fig.add_trace(
+            go.Scatter(
+                x=[row["ym"] for row in series],
+                y=[row["bench"] for row in series],
+                name="Yardstick",
+                line={"color": "#1f6f66", "width": 1.5},
+            )
+        )
+    fig.update_layout(
+        height=360,
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        paper_bgcolor="#fbf9f4",
+        plot_bgcolor="#fbf9f4",
+        legend={"orientation": "h"},
+        yaxis_title="Growth of one rupee",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _peer_table(st, analysis: dict) -> None:
@@ -714,11 +959,18 @@ def _peer_table(st, analysis: dict) -> None:
             }
         )
     if len(table) == 1:
-        st.caption("No peer funds came back from the feed.")
+        st.caption("Sample of 0. No peer funds came back from the feed.")
+    else:
+        st.caption(f"Sample of {len(table) - 1}.")
     st.table(table)
 
 
 if os.environ.get("BOOK_SELFTEST") == "1":
+    book = holdings_book(122639)
+    assert book is not None and book["unknown"] > 0.5
+    assert herfindahl([row[2] for row in book["rows"]]) is None
+    assert abs((known_overlap(122639, 120716) or 0) - 0.30) < 1e-9
+    assert abs((herfindahl([0.5, 0.5]) or 0) - 0.5) < 1e-12
     sample = analyse(122639, 12)
     print(sample["fund"]["name"])
     print(sample["fund"]["category"], sample["equity"], sample["paired"], sample["start"], sample["end"])
